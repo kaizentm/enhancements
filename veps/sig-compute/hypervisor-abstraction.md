@@ -56,15 +56,7 @@ Introduce a Hypervisor Abstraction Layer that lets KubeVirt plug in multiple hyp
 
 Cluster configuration (`spec.configuration.hypervisorConfiguration.name`) declares the active hypervisor for the entire installation, and each control-plane package exposes focused extension contracts so downstream implementations only touch the areas they actually need:
 
- - **Defaults provider registry (`pkg/defaults/providers/`)** – Introduces a single `DefaultsProvider` interface applied in layered order (Base → Hypervisor → Architecture → Hypervisor+Architecture → Finalization). Providers are registered under composite keys like `kvm/amd64` or `mshv/arm64`. Each provider implements:
-   ```go
-   type DefaultsProvider interface {
-       ApplyVMDefaults(vm *v1.VirtualMachine, cc *virtconfig.ClusterConfig, client kubecli.KubevirtClient)
-       ApplyVMISpecDefaults(spec *v1.VirtualMachineInstanceSpec, cc *virtconfig.ClusterConfig) error
-       FinalizeVMI(vmi *v1.VirtualMachineInstance, cc *virtconfig.ClusterConfig) error
-   }
-   ```
-   Only zero-value fields are set at each layer; `FinalizeVMI` handles derived/status data (CPU topology snapshot, memory status, hotplug sizing, feature dependency resolution). Existing public functions delegate to the resolved provider for backwards compatibility.
+ - **Defaults mutator dispatcher (`pkg/defaults/dispatch/`)** – Defaulting is expressed as small, pure mutator functions grouped by specificity: Base, Hypervisor, Architecture, Hypervisor+Architecture, then Finalizers. At admission/reconcile time we build a deterministic slice and execute each mutator in order. Later mutators may refine (override) values set earlier. Registration helpers populate global maps during `init()`; selection just assembles the pipeline for the resolved hypervisor+arch. This keeps mutators loosely coupled and testable as independent units.
 - **Runtime interface (`pkg/hypervisor/runtime/`)** – Provides a shared `HypervisorRuntime` contract for runtime-specific behavior such as `AdjustResources`, `HandleHousekeeping`, and `GetMemoryOverhead`. Each implementation registers under the same hypervisor key so `virt-controller`, `virt-handler`, and virt-launcher can resolve the correct runtime hooks.
 - **Converter library (`pkg/virt-launcher/virtwrap/converter/hypervisor/`)** – Implements the new `HypervisorConverter` interface described below. Each hypervisor file focuses on XML/domain differences while `base.go` holds the shared helpers. The converter selects the correct implementation via a local registry keyed by hypervisor name.
 - **Admission webhooks (`pkg/virt-api/webhooks/validating-webhook/admitters/hypervisor/`)** – Surface validation and mutation helpers that wrap existing webhook entry points. The admitters use the same cluster-configured hypervisor value as `virt-controller` and invoke the matching implementation.
@@ -107,88 +99,72 @@ spec:
 
 ### Hypervisor-Specific Defaults
 
-The defaults system is refactored to support multi-axis overrides (hypervisor, architecture, combined) without expanding large `switch` statements.
+The functional dispatcher model expresses defaulting as ordered mutator functions instead of embedded provider structs. This reduces structural boilerplate and makes each concern testable in isolation.
 
 Precedence (least → most specific):
-1. Base defaults (generic cluster configuration driven)
-2. Hypervisor layer (e.g. kvm-wide adjustments)
-3. Architecture layer (generic amd64, arm64, s390x adjustments)
-4. Hypervisor+Architecture layer (fine-grained divergence)
-5. Finalization (derived/status + feature dependency resolution)
+1. Base mutators (generic cluster configuration driven)
+2. Hypervisor mutators (e.g. kvm-wide adjustments)
+3. Architecture mutators (generic amd64, arm64, s390x adjustments)
+4. Hypervisor+Architecture mutators (fine-grained divergence)
+5. Finalizers (derived/status + feature dependency resolution)
 
-Rules:
-* Each layer sets only zero-value (unset) fields.
-* User-specified values are never overridden.
-* Finalization runs once after all mutation layers.
-
-Interface (single contract):
+Core types:
 ```go
-type DefaultsProvider interface {
-  ApplyVMDefaults(vm *v1.VirtualMachine, cc *virtconfig.ClusterConfig, client kubecli.KubevirtClient)
-  ApplyVMISpecDefaults(spec *v1.VirtualMachineInstanceSpec, cc *virtconfig.ClusterConfig) error
-  FinalizeVMI(vmi *v1.VirtualMachineInstance, cc *virtconfig.ClusterConfig) error
+type VMIContext struct {
+  Original      *v1.VirtualMachineInstance // snapshot before any mutation
+  ClusterConfig *virtconfig.ClusterConfig
+}
+
+// VMIMutator mutates the VMI spec in place.
+type VMIMutator func(spec *v1.VirtualMachineInstanceSpec, ctx *VMIContext) error
+
+// VMIFinalizer runs after all mutators; may derive status or dependent fields.
+type VMIFinalizer func(vmi *v1.VirtualMachineInstance, ctx *VMIContext) error
+```
+
+Registration stores mutators by specificity:
+```go
+var baseMutators []VMIMutator
+var hypervisorMutators = map[string][]VMIMutator{}
+var archMutators = map[string][]VMIMutator{}
+var hypervisorArchMutators = map[string]map[string][]VMIMutator{} // hv -> arch -> []VMIMutator
+var finalizers = map[string][]VMIFinalizer{} // keyed by hypervisor (arch-specific finalizers rarely needed)
+
+func RegisterBase(mutators ...VMIMutator) { baseMutators = append(baseMutators, mutators...) }
+func RegisterHypervisor(hv string, mutators ...VMIMutator) { hypervisorMutators[hv] = append(hypervisorMutators[hv], mutators...) }
+func RegisterArch(arch string, mutators ...VMIMutator) { archMutators[arch] = append(archMutators[arch], mutators...) }
+func RegisterHypervisorArch(hv, arch string, mutators ...VMIMutator) {
+  m := hypervisorArchMutators[hv]
+  if m == nil { m = map[string][]VMIMutator{}; hypervisorArchMutators[hv] = m }
+  m[arch] = append(m[arch], mutators...)
+}
+func RegisterFinalizers(hv string, fns ...VMIFinalizer) { finalizers[hv] = append(finalizers[hv], fns...) }
+```
+
+Applying defaults (webhook/controller):
+```go
+func ApplyDefaults(vmi *v1.VirtualMachineInstance, hypervisor, arch string, cc *virtconfig.ClusterConfig) error {
+  ctx := &VMIContext{Original: vmi.DeepCopy(), ClusterConfig: cc}
+  spec := &vmi.Spec
+
+  // Execute mutators in deterministic precedence order
+  for _, fn := range baseMutators { if err := fn(spec, ctx); err != nil { return err } }
+  for _, fn := range hypervisorMutators[hypervisor] { if err := fn(spec, ctx); err != nil { return err } }
+  for _, fn := range archMutators[arch] { if err := fn(spec, ctx); err != nil { return err } }
+  if hvMap := hypervisorArchMutators[hypervisor]; hvMap != nil {
+    for _, fn := range hvMap[arch] { if err := fn(spec, ctx); err != nil { return err } }
+  }
+  for _, fin := range finalizers[hypervisor] { if err := fin(vmi, ctx); err != nil { return err } }
+  return nil
 }
 ```
 
-Embedding hierarchy examples:
-```go
-type BaseDefaults struct{}
-type KVMDefaults struct { *BaseDefaults }
-type MSHVDefaults struct { *BaseDefaults }
-type ArchAMD64Defaults struct { *BaseDefaults }
-type ArchArm64Defaults struct { *BaseDefaults }
-type ArchS390XDefaults struct { *BaseDefaults }
-// Combined
-type KVMAmd64Defaults struct { *KVMDefaults }
-type KVMArm64Defaults struct { *KVMDefaults }
-type KVMS390XDefaults struct { *KVMDefaults }
-type MSHVAmd64Defaults struct { *MSHVDefaults }
-```
-
-Resolution map (composite key):
-```go
-var providers = map[string]DefaultsProvider{
-  "kvm/amd64":  &KVMAmd64Defaults{&KVMDefaults{&BaseDefaults{}}},
-  "kvm/arm64":  &KVMArm64Defaults{&KVMDefaults{&BaseDefaults{}}},
-  "kvm/s390x":  &KVMS390XDefaults{&KVMDefaults{&BaseDefaults{}}},
-  "mshv/amd64": &MSHVAmd64Defaults{&MSHVDefaults{&BaseDefaults{}}},
-  "kvm":        &KVMDefaults{&BaseDefaults{}},
-  "mshv":       &MSHVDefaults{&BaseDefaults{}},
-  "amd64":      &ArchAMD64Defaults{&BaseDefaults{}}, // optional generic arch layer
-  "arm64":      &ArchArm64Defaults{&BaseDefaults{}},
-  "s390x":      &ArchS390XDefaults{&BaseDefaults{}},
-  "":           &BaseDefaults{},
-}
-
-func ResolveDefaultsProvider(hypervisor, arch string) DefaultsProvider {
-  if p, ok := providers[hypervisor+"/"+arch]; ok { return p }
-  if p, ok := providers[hypervisor]; ok { return p }
-  if p, ok := providers[arch]; ok { return p }
-  return providers[""]
-}
-
-// RegisterDefaultsProvider allows hypervisor or arch-specific packages to register
-// their implementations at init time. Not concurrency-safe by design; all
-// registrations occur during Go init sequencing before any controller threads
-// resolve providers.
-func RegisterDefaultsProvider(key string, p DefaultsProvider) {
-  providers[key] = p
-}
-```
-
-Invocation flow (webhook / controller):
-```go
-provider := ResolveDefaultsProvider(detectedHypervisor, detectedArch)
-provider.ApplyVMISpecDefaults(&vmi.Spec, clusterConfig)
-provider.FinalizeVMI(vmi, clusterConfig)
-```
-
-Migration steps:
-1. Introduce interface + base provider wrapping existing logic (no behavior change).
-2. Move architecture-specific functions into provider structs; keep old functions as thin wrappers (marked deprecated).
-3. Enable hypervisor resolution (defaulting to "kvm" until hypervisor config is set).
-4. Add combined providers only when divergence appears.
-5. Remove deprecated wrappers after grace period.
+Migration steps from legacy architecture functions:
+1. Wrap existing architecture-specific logic in mutators and register under the appropriate bucket (e.g. `RegisterArch("amd64", Amd64CPUModelMutator)`).
+2. Introduce hypervisor mutators returning the same defaults currently hard-coded for KVM; enable feature gate for hypervisor selection.
+3. Add combined hypervisor+arch mutators only where divergence appears (e.g. machine type differences).
+4. Implement finalizers for derived data currently handled in follow-up controller passes.
+5. Deprecate old `SetAmd64Defaults` style functions after confirming parity via integration tests.
 
 
 ### Hypervisor-Specific Validations
@@ -242,32 +218,39 @@ With this configuration in place, every VMI reconciled by the control plane inhe
 
 ### Adding a Hypervisor Implementation
 
-1. **Defaults Provider** – `pkg/defaults/providers/sample.go` (or `pkg/defaults/providers/sample_amd64.go` when arch-specific):
+1. **Defaults Mutators** – `pkg/defaults/dispatch/sample.go` (and optionally `sample_amd64.go` for arch-specific refinements):
 
    ```go
    // sample.go
-   type SampleDefaults struct{ *BaseDefaults }
-
-   func (d *SampleDefaults) ApplyVMDefaults(vm *v1.VirtualMachine, cc *virtconfig.ClusterConfig, client kubecli.KubevirtClient) {
-       d.BaseDefaults.ApplyVMDefaults(vm, cc, client) // call embedded base first
-       // sample hypervisor-wide VM template tweaks (if any)
-   }
-
-   func (d *SampleDefaults) ApplyVMISpecDefaults(spec *v1.VirtualMachineInstanceSpec, cc *virtconfig.ClusterConfig) error {
-       if err := d.BaseDefaults.ApplyVMISpecDefaults(spec, cc); err != nil { return err }
-       // set zero-value fields only (e.g. disk bus, firmware) for sample hypervisor
-       return nil
-   }
-
-   func (d *SampleDefaults) FinalizeVMI(vmi *v1.VirtualMachineInstance, cc *virtconfig.ClusterConfig) error {
-       // derived/status adjustments after all layers
-       return d.BaseDefaults.FinalizeVMI(vmi, cc)
-   }
+   package dispatch
 
    func init() {
-       RegisterDefaultsProvider("sample", &SampleDefaults{&BaseDefaults{}})
-       // Example arch-specific divergence:
-       // RegisterDefaultsProvider("sample/amd64", &SampleAmd64Defaults{SampleDefaults: &SampleDefaults{&BaseDefaults{}}})
+     // Base mutator example: supply generic defaults if unset
+     RegisterBase(func(spec *v1.VirtualMachineInstanceSpec, ctx *VMIContext) error {
+       if spec.Domain.Machine == nil { spec.Domain.Machine = &v1.Machine{Type: "pc"} }
+       return nil
+     })
+
+     // Hypervisor-wide mutator: refine machine type for sample hypervisor
+     RegisterHypervisor("sample", func(spec *v1.VirtualMachineInstanceSpec, ctx *VMIContext) error {
+       // only override if user did not specify
+       if ctx.Original.Spec.Domain.Machine == nil || ctx.Original.Spec.Domain.Machine.Type == "" {
+         spec.Domain.Machine.Type = "sample-q35"
+       }
+       return nil
+     })
+
+     // Optional combined hypervisor+arch mutator
+     RegisterHypervisorArch("sample", "amd64", func(spec *v1.VirtualMachineInstanceSpec, ctx *VMIContext) error {
+       if ctx.Original.Spec.Domain.CPU == nil { spec.Domain.CPU = &v1.CPU{Model: "sample-zen"} }
+       return nil
+     })
+
+     // Finalizer: derive CPU topology snapshot
+     RegisterFinalizers("sample", func(vmi *v1.VirtualMachineInstance, ctx *VMIContext) error {
+       // populate status fields or annotations based on finalized spec
+       return nil
+     })
    }
    ```
 
