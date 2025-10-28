@@ -65,10 +65,12 @@ Cluster configuration (`spec.configuration.hypervisorConfiguration.name`) declar
    }
    ```
    Only zero-value fields are set at each layer; `FinalizeVMI` handles derived/status data (CPU topology snapshot, memory status, hotplug sizing, feature dependency resolution). Existing public functions delegate to the resolved provider for backwards compatibility.
+
+- **Capability registry (`pkg/capabilities/`)** – Provides a centralized, declarative model for expressing which features are supported, unsupported, or experimental on each hypervisor+architecture combination. The registry enables automatic validation, test filtering, and clear error messages without duplicating logic across components. Each hypervisor declares its capabilities once (e.g., `pkg/capabilities/hypervisor/kvm/amd64.go`) and all validation/testing consumes these declarations.
 - **Runtime interface (`pkg/hypervisor/runtime/`)** – Provides a shared `HypervisorRuntime` contract for runtime-specific behavior such as `AdjustResources`, `HandleHousekeeping`, and `GetMemoryOverhead`. Each implementation registers under the same hypervisor key so `virt-controller`, `virt-handler`, and virt-launcher can resolve the correct runtime hooks.
 - **Converter library (`pkg/virt-launcher/virtwrap/converter/hypervisor/`)** – Implements the new `HypervisorConverter` interface described below. Each hypervisor file focuses on XML/domain differences while `base.go` holds the shared helpers. The converter selects the correct implementation via a local registry keyed by hypervisor name.
-- **Admission webhooks (`pkg/virt-api/webhooks/validating-webhook/admitters/hypervisor/`)** – Surface validation and mutation helpers that wrap existing webhook entry points. The admitters use the same cluster-configured hypervisor value as `virt-controller` and invoke the matching implementation.
-- **Node labeller (`pkg/virt-handler/node-labeller/hypervisor/`)** – Adds a lightweight hook so each hypervisor can declare the devices to probe, the preferred libvirt `virt-type`, and optional feature discovery (such as Hyper-V enlightenments for KVM on amd64).
+- **Admission webhooks (`pkg/virt-api/webhooks/validating-webhook/admitters/hypervisor/`)** – Validation uses the capability registry to automatically reject VMI configurations with unsupported features, generating rich error messages with documentation links. This replaces scattered architecture-specific validation with centralized capability queries.
+- **Node labeller (`pkg/virt-handler/node-labeller/hypervisor/`)** – Adds a lightweight hook so each hypervisor can declare the devices to probe, the preferred libvirt `virt-type`, and optional feature discovery (such as Hyper-V enlightenments for KVM on amd64). Can also expose capability labels on nodes for scheduling purposes.
 
 This split preserves the “implement once, reuse everywhere” story without routing everything through a monolithic interface. New hypervisors can land incrementally—start with defaults and webhooks, add converter support, then extend node labelling—while keeping the contract for each area explicit and testable.
 
@@ -89,6 +91,47 @@ spec:
 - `virt-controller` reads the configured hypervisor from `ClusterConfig` when generating launcher manifests and threads that ID through the `ConverterContext` so downstream components can act consistently.
 - Each package's registry uses the configured name to locate its implementation, avoiding a monolithic factory while keeping selection logic consistent.
 
+### Capability Registry Model
+
+The capability registry provides a declarative, structured way to express feature support:
+
+```go
+// Core types in pkg/capabilities/types.go
+type CapabilityKey string  // e.g., "graphics.vga", "firmware.secureboot.uefi"
+type SupportLevel int      // Supported, Unsupported, Experimental, Deprecated
+
+type Capability struct {
+    Level       SupportLevel
+    Message     string   // User-facing explanation
+    Since       string   // Version when support added
+    DocLink     string   // Link to documentation
+    GatedBy     string   // Optional: feature gate name
+}
+
+type CapabilitySet map[CapabilityKey]Capability
+```
+
+Each hypervisor+architecture combination declares its capabilities:
+
+```go
+// In pkg/capabilities/hypervisor/kvm/arm64.go
+func init() {
+    capabilities.Register("kvm", "arm64", CapabilitySet{
+        CapGraphicsVGA: {
+            Level: Unsupported,
+            Message: "VGA graphics not supported on ARM64 architecture",
+            DocLink: "https://kubevirt.io/user-guide/arm64-limitations",
+        },
+        CapGraphicsVirtIO: {
+            Level: Supported,
+            Message: "VirtIO graphics fully supported on KVM/arm64",
+            Since: "v0.30.0",
+        },
+        // ... more capabilities
+    })
+}
+```
+
 ### Integration with Defaults, Runtime, and Converter
 
 1. `virt-controller` and `virt-handler` read the configured hypervisor from `ClusterConfig`, add that ID to the serialized `ConverterContext` they already ship alongside the launcher pod, and virt-launcher folds it into its `DomainContext` right before domain generation.
@@ -107,7 +150,10 @@ spec:
 
 ### Hypervisor-Specific Defaults
 
-The defaults system is refactored to support multi-axis overrides (hypervisor, architecture, combined) without expanding large `switch` statements.
+- `pkg/capabilities/hypervisor/` hosts capability declarations organized by hypervisor and architecture (e.g., `kvm/amd64.go`, `kvm/arm64.go`, `hyperv-layered/amd64.go`). Each file declares which features are supported, unsupported, or experimental for that specific combination.
+- `pkg/defaults/ is refactored to support multi-axis overrides (hypervisor, architecture, combined) without expanding large `switch` statements.
+- `pkg/hypervisor/runtime/` introduces a sibling registry for `HypervisorRuntime` implementations. `virt-controller` consults it to call `AdjustResources` and `GetMemoryOverhead`, while virt-handler and virt-launcher reuse the same implementation for memlock sizing and `HandleHousekeeping`.
+- `pkg/virt-api/webhooks/validating-webhook/admitters/` uses the capability registry for automatic validation. The `VMIFeatureMapper` in `pkg/capabilities/vmi/mapper.go` extracts required capabilities from a VMI spec and queries the registry. This eliminates scattered architecture-specific validation files in favor of centralized capability queries.
 
 Precedence (least → most specific):
 1. Base defaults (generic cluster configuration driven)
@@ -209,7 +255,13 @@ Key points:
 ### Validation & Mutation Webhooks
 
 - The mutating webhook shares the same resolution flow and invokes `MutateVMI` early in the admission chain, giving providers a chance to normalize the spec (for example, seeding Hyper-V Layered feature blocks or toggling defaults) before Kubernetes persists the object.
-- Hypervisors can use `Validate` to enforce requirements. The validating webhooks inside `virt-api` read the configured hypervisor from `ClusterConfig`, matching the value embedded by `virt-controller`, so admission stays consistent with reconciliation.
+- The validating webhooks use the capability registry for automatic, consistent validation:
+  1. `VMIFeatureMapper` analyzes the VMI spec to extract required capabilities (e.g., if `video.type: vga`, requires `graphics.vga` capability)
+  2. Registry queries check if each capability is supported on the target hypervisor+architecture
+  3. Unsupported features generate rich error messages with explanations and documentation links
+  4. Unknown features log warnings but pass through (progressive enhancement during migration)
+- This approach replaces scattered validation logic (like `pkg/virt-api/webhooks/arm64.go`, `s390x.go`) with centralized capability queries, ensuring consistent validation behavior across all hypervisors.
+- The validating webhooks inside `virt-api` read the configured hypervisor from `ClusterConfig`, matching the value embedded by `virt-controller`, so admission stays consistent with reconciliation.
 - In tandem, these hooks enable opinionated defaults for each hypervisor while still rejecting incompatible specs, delivering flexibility without sacrificing guardrails.
 
 ### Observability Hooks
@@ -270,7 +322,7 @@ With this configuration in place, every VMI reconciled by the control plane inhe
    }
    ```
 
-2. **Runtime** – Add `pkg/hypervisor/runtime/sample.go` implementing the `HypervisorRuntime` interface so controllers, handlers, and virt-launcher share runtime hooks.
+1. **Runtime** – Add `pkg/hypervisor/runtime/sample.go` implementing the `HypervisorRuntime` interface so controllers, handlers, and virt-launcher share runtime hooks.
 
    ```go
    type sampleRuntime struct{}
@@ -294,7 +346,7 @@ With this configuration in place, every VMI reconciled by the control plane inhe
    }
    ```
 
-3. **Converter** – Add `pkg/virt-launcher/virtwrap/converter/hypervisor/sample.go` implementing the `HypervisorConverter` interface (overriding only the methods that differ from the base helper).
+1. **Converter** – Add `pkg/virt-launcher/virtwrap/converter/hypervisor/sample.go` implementing the `HypervisorConverter` interface (overriding only the methods that differ from the base helper).
 
    ```go
    type sampleConverter struct {
@@ -316,9 +368,9 @@ With this configuration in place, every VMI reconciled by the control plane inhe
    }
    ```
 
-4. **Admission** – Create `pkg/virt-api/webhooks/validating-webhook/admitters/hypervisor/sample.go` that exports `MutateVMI` and `Validate` functions and register them in the webhook registry.
+1. **Admission** – Create `pkg/virt-api/webhooks/validating-webhook/admitters/hypervisor/sample.go` that exports `MutateVMI` and `Validate` functions and register them in the webhook registry.
 
-4. **Node labeller (optional for MVP)** – Provide `pkg/virt-handler/node-labeller/hypervisor/sample.go` declaring the devices and libvirt `virt-type` to probe. If the hypervisor relies on architecture-specific features, add the corresponding helper hooks.
+1. **Node labeller (optional for MVP)** – Provide `pkg/virt-handler/node-labeller/hypervisor/sample.go` declaring the devices and libvirt `virt-type` to probe. If the hypervisor relies on architecture-specific features, add the corresponding helper hooks.
 
    ```go
    type sampleLabeller struct{}
@@ -335,6 +387,36 @@ With this configuration in place, every VMI reconciled by the control plane inhe
 
    func init() {
      RegisterHypervisorLabeller("sample", sampleLabeller{})
+   }
+   ```
+
+1. **Capabilities** – Declare feature support for each architecture in `pkg/capabilities/hypervisor/sample/`:
+
+   ```go
+   // pkg/capabilities/hypervisor/sample/amd64.go
+   func init() {
+       capabilities.Register("sample", "amd64", CapabilitySet{
+           CapGraphicsVirtIO: {
+               Level: Supported,
+               Message: "VirtIO graphics supported on sample/amd64",
+               Since: "v1.0.0",
+           },
+           CapGraphicsVGA: {
+               Level: Unsupported,
+               Message: "VGA graphics not supported on sample hypervisor",
+               DocLink: "https://example.com/sample/graphics",
+           },
+           CapSecureBootUEFI: {
+               Level: Experimental,
+               Message: "UEFI Secure Boot experimental on sample",
+               GatedBy: "SampleSecureBoot",
+           },
+           CapCPUHotplug: {
+               Level: Unsupported,
+               Message: "CPU hotplug not yet implemented for sample",
+           },
+           // Declare all relevant capabilities...
+       })
    }
    ```
 
@@ -363,8 +445,38 @@ Full abstraction with—multi-device descriptors, richer domain defaults, hyperv
 ## Functional Testing Approach
 
 - Unit tests for each hypervisor implementation verifying domain defaults and mutators.
+- Unit tests for capability registry ensuring correct capability queries and feature extraction.
 - Integration tests covering virt-controller manifest rendering and device manager plugin registration with other hypervisors enabled.
+- Integration tests verifying admission webhooks reject unsupported feature combinations with appropriate error messages.
 - End-to-end lanes that launch VMIs under at least two hypervisors (e.g., KVM plus a stub hypervisor) to confirm scheduling and domain generation.
+- Test filtering verification: Ensure tests with capability decorators run only on compatible hypervisor+architecture combinations.
+
+### Test Filtering Integration
+
+The capability registry enables automatic test filtering so tests only run on compatible infrastructure:
+
+```go
+// tests/decorators/capabilities.go
+var (
+    RequiresVGAGraphics    = decorators.RequiresCapability(capabilities.CapGraphicsVGA)
+    RequiresCPUHotplug     = decorators.RequiresCapability(capabilities.CapCPUHotplug)
+    RequiresSecureBoot     = decorators.RequiresCapability(capabilities.CapSecureBootUEFI)
+)
+
+// Test automatically skips if capability unsupported
+It("should support VGA graphics", RequiresVGAGraphics, func() {
+    vmi := libvmifact.NewCirros()
+    vmi.Spec.Domain.Devices.Video = &v1.Video{Type: "vga"}
+    // Test runs only on hypervisor+arch combos that support VGA
+})
+```
+
+The test framework generates label filters from the capability registry:
+- On KVM/amd64: VGA tests run
+- On KVM/arm64: VGA tests automatically skip (VGA unsupported)
+- On hyperv-layered: VGA tests automatically skip
+
+This eliminates scattered skip logic and ensures tests run only where they should.
 
 ## Implementation History
 
@@ -377,12 +489,18 @@ Full abstraction with—multi-device descriptors, richer domain defaults, hyperv
 - Feature gate covers configurable hypervisor
 - Cluster-wide hypervisor configuration implemented and consumed by defaults, converter, and webhooks.
 - Basic functional tests for alternative hypervisor scheduling and domain generation.
+- Capability registry implemented with KVM capabilities for amd64, arm64, and s390x.
+- Validation webhooks use capability registry to reject unsupported configurations.
+- Test filtering framework using capability decorators.
 
 ### Beta
 
 - Monitoring and observability hooks consumed by community dashboards.
 - Upgrade/rollback testing executed in CI.
+- Capability-based test filtering integrated into CI pipelines.
 
 ### GA
 
 - Documentation reflects hypervisor lifecycle and contributor workflow.
+- All architecture-specific validation code replaced with capability queries.
+- Capability registry covers all major features (graphics, firmware, CPU, networking, storage).
