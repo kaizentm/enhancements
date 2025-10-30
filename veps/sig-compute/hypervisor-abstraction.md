@@ -66,7 +66,7 @@ Cluster configuration (`spec.configuration.hypervisorConfiguration.name`) declar
    ```
    Only zero-value fields are set at each layer; `FinalizeVMI` handles derived/status data (CPU topology snapshot, memory status, hotplug sizing, feature dependency resolution). Existing public functions delegate to the resolved provider for backwards compatibility.
 
-- **Capability registry (`pkg/capabilities/`)** – Provides a centralized, declarative model for expressing which features are supported, unsupported, or experimental on each hypervisor+architecture combination. The registry enables automatic validation, test filtering, and clear error messages without duplicating logic across components. Each hypervisor declares its capabilities once (e.g., `pkg/capabilities/hypervisor/kvm/amd64.go`) and all validation/testing consumes these declarations.
+- **Capability registry (`pkg/capabilities/`)** – Provides a centralized, declarative matrix for expressing which features are supported, unsupported, or experimental on each hypervisor+architecture combination. All capabilities are defined once in `pkg/capabilities/definitions.go`, and hypervisor implementations register their support using a builder pattern with inheritance. The registry enables automatic validation, test filtering, and clear error messages without duplicating logic across components. Resolution follows a layered fallback strategy (hypervisor/arch → hypervisor → default) similar to the defaults provider pattern.
 - **Runtime interface (`pkg/hypervisor/runtime/`)** – Provides a shared `HypervisorRuntime` contract for runtime-specific behavior such as `AdjustResources`, `HandleHousekeeping`, and `GetMemoryOverhead`. Each implementation registers under the same hypervisor key so `virt-controller`, `virt-handler`, and virt-launcher can resolve the correct runtime hooks.
 - **Converter library (`pkg/virt-launcher/virtwrap/converter/hypervisor/`)** – Implements the new `HypervisorConverter` interface described below. Each hypervisor file focuses on XML/domain differences while `base.go` holds the shared helpers. The converter selects the correct implementation via a local registry keyed by hypervisor name.
 - **Admission webhooks (`pkg/virt-api/webhooks/validating-webhook/admitters/hypervisor/`)** – Validation uses the capability registry to automatically reject VMI configurations with unsupported features, generating rich error messages with documentation links. This replaces scattered architecture-specific validation with centralized capability queries.
@@ -93,7 +93,7 @@ spec:
 
 ### Capability Registry Model
 
-The capability registry provides a declarative, structured way to express feature support:
+The capability registry provides a centralized, declarative matrix for expressing feature support. Instead of requiring separate files per hypervisor+architecture combination, all capabilities are defined once and hypervisor implementations register their support using a builder pattern:
 
 ```go
 // Core types in pkg/capabilities/types.go
@@ -108,29 +108,115 @@ type Capability struct {
     GatedBy     string   // Optional: feature gate name
 }
 
-type CapabilitySet map[CapabilityKey]Capability
-```
-
-Each hypervisor+architecture combination declares its capabilities:
-
-```go
-// In pkg/capabilities/hypervisor/kvm/arm64.go
-func init() {
-    capabilities.Register("kvm", "arm64", CapabilitySet{
-        CapGraphicsVGA: {
-            Level: Unsupported,
-            Message: "VGA graphics not supported on ARM64 architecture",
-            DocLink: "https://kubevirt.io/user-guide/arm64-limitations",
-        },
-        CapGraphicsVirtIO: {
-            Level: Supported,
-            Message: "VirtIO graphics fully supported on KVM/arm64",
-            Since: "v0.30.0",
-        },
-        // ... more capabilities
-    })
+type CapabilityInfo struct {
+    Description string   // Capability description
+    DocLink     string   // Default documentation link
 }
 ```
+
+All capabilities are defined once in a central registry:
+
+```go
+// pkg/capabilities/definitions.go - Define ALL capabilities once
+const (
+    CapGraphicsVGA       CapabilityKey = "graphics.vga"
+    CapGraphicsVirtIO    CapabilityKey = "graphics.virtio"
+    CapSecureBootUEFI    CapabilityKey = "firmware.secureboot.uefi"
+    CapCPUHotplug        CapabilityKey = "cpu.hotplug"
+    // ... all capabilities declared as constants
+)
+
+var CapabilityDefs = map[CapabilityKey]CapabilityInfo{
+    CapGraphicsVGA: {
+        Description: "VGA graphics support",
+        DocLink:     "https://kubevirt.io/user-guide/graphics#vga",
+    },
+    CapGraphicsVirtIO: {
+        Description: "VirtIO GPU support",
+        DocLink:     "https://kubevirt.io/user-guide/graphics#virtio",
+    },
+    CapSecureBootUEFI: {
+        Description: "UEFI Secure Boot support",
+        DocLink:     "https://kubevirt.io/user-guide/firmware#secureboot",
+    },
+    // ... metadata for all capabilities
+}
+```
+
+Hypervisor+architecture combinations register their support using a builder pattern with inheritance:
+
+```go
+// pkg/capabilities/registry.go - Matrix registration with builder pattern
+type CapabilityMatrix struct {
+    matrix map[string]map[CapabilityKey]Capability // "hypervisor/arch" or "hypervisor" -> capabilities
+}
+
+type CapabilityBuilder struct {
+    matrix *CapabilityMatrix
+    key    string
+}
+
+func Register(hypervisor, arch string) *CapabilityBuilder {
+    // Returns builder for registering capabilities
+}
+
+func (b *CapabilityBuilder) Support(caps ...CapabilityKey) *CapabilityBuilder {
+    // Mark capabilities as supported
+}
+
+func (b *CapabilityBuilder) Experimental(cap CapabilityKey, gate string) *CapabilityBuilder {
+    // Mark capability as experimental with feature gate
+}
+
+func (b *CapabilityBuilder) Unsupported(caps ...CapabilityKey) *CapabilityBuilder {
+    // Explicitly mark as unsupported (for clarity/documentation)
+}
+
+func (b *CapabilityBuilder) WithMessage(cap CapabilityKey, msg string) *CapabilityBuilder {
+    // Customize message for specific capability
+}
+
+// Usage in init() - hypervisor implementations register support:
+func init() {
+    // Register base KVM support (applies to all KVM archs unless overridden)
+    Register("kvm", "").  // empty arch = hypervisor-wide default
+        Support(CapGraphicsVirtIO, CapSecureBootUEFI).
+        Experimental(CapCPUHotplug, "CPUHotplug")
+    
+    // Architecture-specific overrides for KVM
+    Register("kvm", "amd64").
+        Support(CapGraphicsVGA).  // VGA only on amd64/s390x
+        WithMessage(CapGraphicsVGA, "VGA graphics fully supported on KVM/amd64")
+    
+    Register("kvm", "arm64").
+        Unsupported(CapGraphicsVGA).
+        WithMessage(CapGraphicsVGA, "VGA graphics not supported on ARM64 architecture")
+    
+    Register("kvm", "s390x").
+        Support(CapGraphicsVGA)
+}
+```
+
+The registry resolves capabilities using a layered fallback strategy:
+
+```go
+// Query with automatic fallback: hypervisor/arch -> hypervisor -> base
+func Get(hypervisor, arch string, cap CapabilityKey) Capability {
+    // Try exact match: kvm/amd64
+    if c, ok := lookup(hypervisor+"/{arch}", cap); ok { return c }
+    
+    // Try hypervisor-wide: kvm
+    if c, ok := lookup(hypervisor, cap); ok { return c }
+    
+    // Default: unsupported with generic message
+    return defaultUnsupported(cap)
+}
+```
+
+Resolution precedence (most specific wins):
+1. **Hypervisor+Architecture** (e.g., `kvm/amd64`) - most specific
+2. **Hypervisor-wide** (e.g., `kvm`) - applies to all architectures unless overridden
+3. **Default** - unsupported with generic message from `CapabilityDefs`
 
 ### Integration with Defaults, Runtime, and Converter
 
@@ -150,7 +236,7 @@ func init() {
 
 ### Hypervisor-Specific Defaults
 
-- `pkg/capabilities/hypervisor/` hosts capability declarations organized by hypervisor and architecture (e.g., `kvm/amd64.go`, `kvm/arm64.go`, `hyperv-layered/amd64.go`). Each file declares which features are supported, unsupported, or experimental for that specific combination.
+- `pkg/capabilities/` hosts the centralized capability registry. `definitions.go` contains all capability constants and metadata, while `registry.go` provides the builder pattern for registration. `init.go` or hypervisor-specific registration files (e.g., `kvm.go`, `hyperv.go`) use the builder to declare support for each hypervisor and architecture combination.
 - `pkg/defaults/ is refactored to support multi-axis overrides (hypervisor, architecture, combined) without expanding large `switch` statements.
 - `pkg/hypervisor/runtime/` introduces a sibling registry for `HypervisorRuntime` implementations. `virt-controller` consults it to call `AdjustResources` and `GetMemoryOverhead`, while virt-handler and virt-launcher reuse the same implementation for memlock sizing and `HandleHousekeeping`.
 - `pkg/virt-api/webhooks/validating-webhook/admitters/` uses the capability registry for automatic validation. The `VMIFeatureMapper` in `pkg/capabilities/vmi/mapper.go` extracts required capabilities from a VMI spec and queries the registry. This eliminates scattered architecture-specific validation files in favor of centralized capability queries.
@@ -390,33 +476,24 @@ With this configuration in place, every VMI reconciled by the control plane inhe
    }
    ```
 
-1. **Capabilities** – Declare feature support for each architecture in `pkg/capabilities/hypervisor/sample/`:
+1. **Capabilities** – Register feature support using the centralized capability registry (typically in `pkg/capabilities/sample-hypervisor.go` or within the same init):
 
    ```go
-   // pkg/capabilities/hypervisor/sample/amd64.go
    func init() {
-       capabilities.Register("sample", "amd64", CapabilitySet{
-           CapGraphicsVirtIO: {
-               Level: Supported,
-               Message: "VirtIO graphics supported on sample/amd64",
-               Since: "v1.0.0",
-           },
-           CapGraphicsVGA: {
-               Level: Unsupported,
-               Message: "VGA graphics not supported on sample hypervisor",
-               DocLink: "https://example.com/sample/graphics",
-           },
-           CapSecureBootUEFI: {
-               Level: Experimental,
-               Message: "UEFI Secure Boot experimental on sample",
-               GatedBy: "SampleSecureBoot",
-           },
-           CapCPUHotplug: {
-               Level: Unsupported,
-               Message: "CPU hotplug not yet implemented for sample",
-           },
-           // Declare all relevant capabilities...
-       })
+       // Register hypervisor-wide support (all architectures)
+       capabilities.Register("sample-hypervisor", "").
+           Support(CapGraphicsVirtIO).
+           Unsupported(CapGraphicsVGA).
+           WithMessage(CapGraphicsVGA, "VGA graphics not supported on sample hypervisor").
+           WithMessage(CapGraphicsVirtIO, "VirtIO graphics supported on all sample architectures")
+       
+       // Architecture-specific overrides
+       capabilities.Register("sample-hypervisor", "amd64").
+           Experimental(CapSecureBootUEFI, "SampleSecureBoot").
+           WithMessage(CapSecureBootUEFI, "UEFI Secure Boot experimental on sample/amd64")
+       
+       // CPU hotplug unsupported everywhere (inherits from hypervisor-wide if not explicitly marked)
+       // No need to repeat unless you want custom messages per arch
    }
    ```
 
