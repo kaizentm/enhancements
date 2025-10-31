@@ -131,68 +131,68 @@ Hypervisor+architecture combinations register their support using a builder patt
 
 ```go
 // pkg/capabilities/registry.go - Matrix registration with builder pattern
-type CapabilityMatrix struct {
+type Capabilities struct {
     matrix map[string]map[CapabilityKey]Capability // "hypervisor/arch" or "hypervisor" -> capabilities
 }
 
-type CapabilityBuilder struct {
-    matrix      *CapabilityMatrix
+type CapabilitiesBuilder struct {
+    matrix      *Capabilities
     platformKey string  // Composite key: "hypervisor/arch" or "hypervisor"
 }
 
-type CapabilityEntryBuilder struct {
-  builder *CapabilityBuilder
+type CapabilityBuilder struct {
+  builder *CapabilitiesBuilder
   cap     CapabilityKey
 }
 
-func Register(hypervisor, arch string) *CapabilityBuilder {
+func Register(hypervisor, arch string) *CapabilitiesBuilder {
     // Returns builder for registering capabilities
 }
 
 // Fluent methods for registering multiple capabilities at once
-func (b *CapabilityBuilder) Support(caps ...CapabilityKey) *CapabilityBuilder {
+func (b *CapabilitiesBuilder) Support(caps ...CapabilityKey) *CapabilitiesBuilder {
     // Mark capabilities as supported
 }
 
-func (b *CapabilityBuilder) Experimental(cap CapabilityKey, gate string) *CapabilityBuilder {
+func (b *CapabilitiesBuilder) Experimental(cap CapabilityKey, gate string) *CapabilitiesBuilder {
     // Mark capability as experimental with feature gate
 }
 
-func (b *CapabilityBuilder) Unsupported(caps ...CapabilityKey) *CapabilityBuilder {
+func (b *CapabilitiesBuilder) Unsupported(caps ...CapabilityKey) *CapabilitiesBuilder {
     // Explicitly mark as unsupported (for clarity/documentation)
 }
 
 // When richer metadata would otherwise repeat the capability key, `Cap(...)` returns a
 // capability-specific builder that keeps the fluent chain focused on a single key.
-func (b *CapabilityBuilder) Cap(cap CapabilityKey) *CapabilityEntryBuilder {
+func (b *CapabilitiesBuilder) Cap(cap CapabilityKey) *CapabilityBuilder {
   // Start capability-specific fluent builder to avoid repeating the key
 }
 
-func (e *CapabilityEntryBuilder) Support() *CapabilityEntryBuilder {
+func (e *CapabilityBuilder) Support() *CapabilityBuilder {
   // Mark capability as supported and continue chaining metadata helpers
 }
 
-func (e *CapabilityEntryBuilder) Experimental(gate string) *CapabilityEntryBuilder {
+func (e *CapabilityBuilder) Experimental(gate string) *CapabilityBuilder {
   // Mark capability as experimental with feature gate and continue chaining
 }
 
-func (e *CapabilityEntryBuilder) Unsupported() *CapabilityEntryBuilder {
+func (e *CapabilityBuilder) Unsupported() *CapabilityBuilder {
   // Explicitly mark capability as unsupported and continue chaining metadata helpers
 }
 
-func (e *CapabilityEntryBuilder) WithMessage(msg string) *CapabilityEntryBuilder {
+func (e *CapabilityBuilder) WithMessage(msg string) *CapabilityBuilder {
   // Attach custom message while staying on the capability-specific builder
 }
 
-func (e *CapabilityEntryBuilder) WithDocLink(link string) *CapabilityEntryBuilder {
+func (e *CapabilityBuilder) WithDocLink(link string) *CapabilityBuilder {
   // Attach documentation link without repeating the capability key
 }
 
-func (e *CapabilityEntryBuilder) WithSince(version string) *CapabilityEntryBuilder {
+func (e *CapabilityBuilder) WithSince(version string) *CapabilityBuilder {
   // Record the release where support landed without repeating the key
 }
 
-func (e *CapabilityEntryBuilder) Done() *CapabilityBuilder {
+func (e *CapabilityBuilder) Done() *CapabilitiesBuilder {
   // Return to the parent builder after finishing metadata customization
 }
 
