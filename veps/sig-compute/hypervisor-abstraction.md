@@ -107,17 +107,15 @@ type Capability struct {
     DocLink     string   // Link to documentation
     GatedBy     string   // Optional: feature gate name
 }
-
-type CapabilityInfo struct {
-    Description string   // Capability description
-    DocLink     string   // Default documentation link
-}
 ```
 
-All capabilities are defined once in a central registry:
+All capabilities are defined once as typed constants:
 
 ```go
 // pkg/capabilities/definitions.go - Define ALL capabilities once
+type CapabilityKey string
+
+// Capability constants - each represents a feature that can be supported/unsupported by hypervisors
 const (
     CapGraphicsVGA       CapabilityKey = "graphics.vga"
     CapGraphicsVirtIO    CapabilityKey = "graphics.virtio"
@@ -125,23 +123,9 @@ const (
     CapCPUHotplug        CapabilityKey = "cpu.hotplug"
     // ... all capabilities declared as constants
 )
-
-var CapabilityDefs = map[CapabilityKey]CapabilityInfo{
-    CapGraphicsVGA: {
-        Description: "VGA graphics support",
-        DocLink:     "https://kubevirt.io/user-guide/graphics#vga",
-    },
-    CapGraphicsVirtIO: {
-        Description: "VirtIO GPU support",
-        DocLink:     "https://kubevirt.io/user-guide/graphics#virtio",
-    },
-    CapSecureBootUEFI: {
-        Description: "UEFI Secure Boot support",
-        DocLink:     "https://kubevirt.io/user-guide/firmware#secureboot",
-    },
-    // ... metadata for all capabilities
-}
 ```
+
+Capabilities are fully defined when hypervisors register their support via the builder pattern. The `Capability` struct populated by the builder contains all necessary metadata (level, message, since, docLink, gatedBy), so no separate capability definition registry is needed.
 
 Hypervisor+architecture combinations register their support using a builder pattern with inheritance:
 
@@ -152,14 +136,20 @@ type CapabilityMatrix struct {
 }
 
 type CapabilityBuilder struct {
-    matrix *CapabilityMatrix
-    key    string
+    matrix      *CapabilityMatrix
+    platformKey string  // Composite key: "hypervisor/arch" or "hypervisor"
+}
+
+type CapabilityEntryBuilder struct {
+  builder *CapabilityBuilder
+  cap     CapabilityKey
 }
 
 func Register(hypervisor, arch string) *CapabilityBuilder {
     // Returns builder for registering capabilities
 }
 
+// Fluent methods for registering multiple capabilities at once
 func (b *CapabilityBuilder) Support(caps ...CapabilityKey) *CapabilityBuilder {
     // Mark capabilities as supported
 }
@@ -172,28 +162,68 @@ func (b *CapabilityBuilder) Unsupported(caps ...CapabilityKey) *CapabilityBuilde
     // Explicitly mark as unsupported (for clarity/documentation)
 }
 
-func (b *CapabilityBuilder) WithMessage(cap CapabilityKey, msg string) *CapabilityBuilder {
-    // Customize message for specific capability
+// When richer metadata would otherwise repeat the capability key, `Cap(...)` returns a
+// capability-specific builder that keeps the fluent chain focused on a single key.
+func (b *CapabilityBuilder) Cap(cap CapabilityKey) *CapabilityEntryBuilder {
+  // Start capability-specific fluent builder to avoid repeating the key
+}
+
+func (e *CapabilityEntryBuilder) Support() *CapabilityEntryBuilder {
+  // Mark capability as supported and continue chaining metadata helpers
+}
+
+func (e *CapabilityEntryBuilder) Experimental(gate string) *CapabilityEntryBuilder {
+  // Mark capability as experimental with feature gate and continue chaining
+}
+
+func (e *CapabilityEntryBuilder) Unsupported() *CapabilityEntryBuilder {
+  // Explicitly mark capability as unsupported and continue chaining metadata helpers
+}
+
+func (e *CapabilityEntryBuilder) WithMessage(msg string) *CapabilityEntryBuilder {
+  // Attach custom message while staying on the capability-specific builder
+}
+
+func (e *CapabilityEntryBuilder) WithDocLink(link string) *CapabilityEntryBuilder {
+  // Attach documentation link without repeating the capability key
+}
+
+func (e *CapabilityEntryBuilder) WithSince(version string) *CapabilityEntryBuilder {
+  // Record the release where support landed without repeating the key
+}
+
+func (e *CapabilityEntryBuilder) Done() *CapabilityBuilder {
+  // Return to the parent builder after finishing metadata customization
 }
 
 // Usage in init() - hypervisor implementations register support:
 func init() {
     // Register base KVM support (applies to all KVM archs unless overridden)
     Register("kvm", "").  // empty arch = hypervisor-wide default
-        Support(CapGraphicsVirtIO, CapSecureBootUEFI).
-        Experimental(CapCPUHotplug, "CPUHotplug")
+      Supprt(CapSecureBootUEFI).
+      Experimental(CapCPUHotplug).
+      Cap(CapGraphicsVirtIO).
+        Support().
+        WithDocLink("https://kubevirt.io/user-guide/graphics#virtio").
+        WithSince("v0.31.0").
+        Done()
     
     // Architecture-specific overrides for KVM
     Register("kvm", "amd64").
-        Support(CapGraphicsVGA).  // VGA only on amd64/s390x
-        WithMessage(CapGraphicsVGA, "VGA graphics fully supported on KVM/amd64")
+      Cap(CapGraphicsVGA).  // VGA only on amd64/s390x
+        Support().
+        WithMessage("VGA graphics fully supported on KVM/amd64").
+        WithDocLink("https://kubevirt.io/user-guide/graphics#vga").
+        Done()
     
     Register("kvm", "arm64").
-        Unsupported(CapGraphicsVGA).
-        WithMessage(CapGraphicsVGA, "VGA graphics not supported on ARM64 architecture")
+      Cap(CapGraphicsVGA).
+        Unsupported().
+        WithMessage("VGA graphics not supported on ARM64 architecture").
+        Done()
     
     Register("kvm", "s390x").
-        Support(CapGraphicsVGA)
+      Support(CapGraphicsVGA)
 }
 ```
 
@@ -203,12 +233,12 @@ The registry resolves capabilities using a layered fallback strategy:
 // Query with automatic fallback: hypervisor/arch -> hypervisor -> base
 func Get(hypervisor, arch string, cap CapabilityKey) Capability {
     // Try exact match: kvm/amd64
-    if c, ok := lookup(hypervisor+"/{arch}", cap); ok { return c }
+  if c, ok := lookup(hypervisor+"/"+arch, cap); ok { return c }
     
     // Try hypervisor-wide: kvm
     if c, ok := lookup(hypervisor, cap); ok { return c }
     
-    // Default: unsupported with generic message
+    // Default: unsupported with a generic "<cap> unsupported" message
     return defaultUnsupported(cap)
 }
 ```
@@ -216,7 +246,7 @@ func Get(hypervisor, arch string, cap CapabilityKey) Capability {
 Resolution precedence (most specific wins):
 1. **Hypervisor+Architecture** (e.g., `kvm/amd64`) - most specific
 2. **Hypervisor-wide** (e.g., `kvm`) - applies to all architectures unless overridden
-3. **Default** - unsupported with generic message from `CapabilityDefs`
+3. **Default** - unsupported with a generic message derived from the capability key (e.g. "graphics.vga unsupported")
 
 ### Integration with Defaults, Runtime, and Converter
 
@@ -236,7 +266,7 @@ Resolution precedence (most specific wins):
 
 ### Hypervisor-Specific Defaults
 
-- `pkg/capabilities/` hosts the centralized capability registry. `definitions.go` contains all capability constants and metadata, while `registry.go` provides the builder pattern for registration. `init.go` or hypervisor-specific registration files (e.g., `kvm.go`, `hyperv.go`) use the builder to declare support for each hypervisor and architecture combination.
+- `pkg/capabilities/` hosts the centralized capability registry. `definitions.go` contains the capability constants, while `registry.go` provides the builder pattern for registering support plus metadata. `init.go` or hypervisor-specific registration files (e.g., `kvm.go`, `hyperv.go`) use the builder to declare support for each hypervisor and architecture combination.
 - `pkg/defaults/ is refactored to support multi-axis overrides (hypervisor, architecture, combined) without expanding large `switch` statements.
 - `pkg/hypervisor/runtime/` introduces a sibling registry for `HypervisorRuntime` implementations. `virt-controller` consults it to call `AdjustResources` and `GetMemoryOverhead`, while virt-handler and virt-launcher reuse the same implementation for memlock sizing and `HandleHousekeeping`.
 - `pkg/virt-api/webhooks/validating-webhook/admitters/` uses the capability registry for automatic validation. The `VMIFeatureMapper` in `pkg/capabilities/vmi/mapper.go` extracts required capabilities from a VMI spec and queries the registry. This eliminates scattered architecture-specific validation files in favor of centralized capability queries.
